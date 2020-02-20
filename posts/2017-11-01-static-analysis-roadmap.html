@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+        <title>setjmp - Static Analysis Roadmap</title>
+        <link rel="stylesheet" type="text/css" href="../css/default.css" />
+        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/font-awesome/4.5.0/css/font-awesome.min.css" />
+        <script type="text/javascript" src="https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+    </head>
+    <body>
+        <div id="header">
+            <div id="logo">
+                <a href="../">setjmp</a>
+            </div>
+            <div id="navigation">
+                <a href="../">Home</a>
+                <a href="../archive.html">Archive</a>
+            </div>
+        </div>
+
+        <div id="content">
+            <h1>Static Analysis Roadmap</h1>
+
+            <div class="info">
+    Posted on November  1, 2017
+    
+    
+    with tags <a href="../tags/static%20analysis.html">static analysis</a>
+    
+</div>
+
+<p>This blog post documents some notes I’ve written up in my shallow studies of static analysis. I’ve tried to organize it topically, into broad categories that I find interesting within static analysis.</p>
+<p>Of course this is not exhaustive (symbolic execution isn’t even in this list!), and really this only includes topics for which I’m actively reading papers.</p>
+<p>I also avoid writing too much, since most concepts are self contained in some seminal paper defining it which I consider accompanying text.</p>
+<h1 id="data-flow-analysis">Data Flow Analysis</h1>
+<p>All modern data flow analysis techniques have been constructed with the intention of aiding compilers to perform essential optimizations that would otherwise be very difficult to perform without some formalization. These common optimizations can be found in the dragon book, among other textbooks and survey papers:</p>
+<ol style="list-style-type: decimal">
+<li>Reaching Definitions</li>
+<li>Dead Code Elimination</li>
+<li>Constant Propagation</li>
+<li>Live Variable Analysis</li>
+<li>Available Expressions</li>
+</ol>
+<p>Note that most of the analysis passes on the list are made trivial by reaching definitions, which computes usage-definition and definition-usage pairs in a given function. Unfortunately, reaching definitions is precisely computable only given a sound and complete CFG, as well as accurate knowledge of all variables in a funcion. A compiler can readily provide this information, but it’s definitely undecideable to determine these for a binary.</p>
+<p>Another interesting addendum to Reaching Definitions is Static Single Assignment Form (SSA) which is used by many compilers, for example by LLVM’s internal representation in order to make the use-def and def-use pairs within a function explicit. The seminal paper defining SSA construction is <em>Efficiently Computing Static Single Assignment Form and the Control Dependence Graph</em>, which internally uses the concept of <em>dominance frontiers</em> to compute minimal SSA form.</p>
+<h2 id="accompanying-text">Accompanying Text</h2>
+<ul>
+<li><em>Engineering a Compiler</em></li>
+<li><em>Compilers: Principles, Techniques and Tools</em></li>
+<li><em>A Survey of Data Flow Analysis Techniques</em></li>
+<li><em>Efficiently Computing Static Single Assignment Form and the Control Dependence Graph</em></li>
+</ul>
+<h1 id="cfg-reconstruction">CFG Reconstruction</h1>
+<p>This section actually goes over CFG Reconstruction, as well as the reconstruction of variables in a function. These are needed in order to compute SSA form or other data flow analysis passes that assume a reasonably accurate CFG. <em>Some</em> techniques are listed below:</p>
+<ul>
+<li>Value Set Analysis</li>
+<li>Bounded Address Tracking</li>
+<li>Value Analysis with Precision Requirement</li>
+</ul>
+<p>Note that Bounded Address Tracking falls under the category of abstract interpretation. Some also say that Value-Set Analysis falls in the domain of abstract interpretation.</p>
+<h2 id="value-set-analysis">Value-Set Analysis</h2>
+<p><em>What you See is Not What You Execute</em>, as well as <em>Analyzing Memory Accesses in x86 Executables</em> seminally define Value-Set Analysis for the purpose of aiding IDA Pro to reconstruct control flow graphs precisely. The papers also use affine relations between registers to more tightly bound the overapproximation of VSA in certain cases.</p>
+<p><em>(State of) The Art of War: Offensive Techniques in Binary Analysis</em> mentions an alternative augmentation to Value-Set Analysis that is less precise than Affine relation analysis but is much less complex. It is based on a custom lightweight algebraic solver, which is used to simplify path predicates to obtain a value interval for each variable in the predicate.</p>
+<h2 id="bounded-address-tracking">Bounded Address Tracking</h2>
+<p><em>Static Analysis of x86 Executables</em>, as well as <em>Precise Static Analysis of Untrusted Driver Binaries</em> define K-set analysis and Bounded Address Tracking. The concept is based heavily on <em>Analyzing Stripped Device-Driver Executables</em> (implemented as DDA/x86 via CodeSurfer/x86). A juicy quote from the paper:</p>
+<blockquote>
+<p>The major differences [is that VSA is] based on more “classic” static analyses such as interval analysis. VSA is path insensitive and thus requires the use of call strings for reasonable results.</p>
+</blockquote>
+<p>However, because an x86 program does not need to maintain a callstack, call strings are unreliable at best for use in this kind of analysis. It’s also interesting to note that bounded address tracking in general computes an underapproximation.</p>
+<h2 id="value-analysis-with-precision-requirements">Value Analysis With Precision Requirements</h2>
+<p>Value Analysis with Precision Requirements (VAPR) uses k-set analysis, much like BAT, but ramps up the precision for k-set every iteration to construct a more and more complete CFG. This is defined in <em>Refinement-based CFG Reconstruction from Unstructured Programs.</em></p>
+<h2 id="tools-listing">Tools Listing</h2>
+<p><em>WYSINWYX</em> and other papers definiing VSA (all work by Gogol Balakrishnan) is implemented as part of CodeSurfer/x86 and DeviceDriverAnalyzer/x86. These are IDA Pro plugins which implement VSA for the purpose of analyzing possible runtime values, and as a side effect construct a more precise CFG than IDA provides by default. VSA is also used in angr and Binary Ninja, and will soon be used in panopticon.</p>
+<p>All of the BAT stuff was written by Johannes Kinder, and is incorporated into the analysis toolkit, jakstab. Panopticon currently uses a rough implementation of BAT. A quick glance shows that falcon also uses k-set analysis (BAT?) in its abstract interpretation implementation.</p>
+<ul>
+<li><a href="https://github.com/angr/angr">angr</a></li>
+<li><a href="https://binary.ninja/2017/11/06/architecture-agnostic-function-detection-in-binaries.html">Binary Ninja</a></li>
+<li><a href="https://www.grammatech.com/products/codesurfer">CodeSurfer/x86</a></li>
+<li><a href="https://github.com/falconre/falcon">Falcon</a></li>
+<li><a href="http://www.jakstab.org/">Jakstab</a></li>
+<li><a href="https://github.com/das-labor/panopticon">Panopticon</a></li>
+</ul>
+<h2 id="accompanying-text-1">Accompanying Text</h2>
+<ul>
+<li><em>What you See is Not What You Execute</em></li>
+<li><em>Analyzing Memory Accesses in x86 Executables</em></li>
+<li><em>Analyzing Stripped Device-Driver Executables</em></li>
+<li><em>Static Analysis of x86 Executables</em></li>
+<li><em>Precise Static Analysis of Untrusted Driver Binaries</em></li>
+<li><em>Refinement-based CFG Reconstruction from Unstructured Programs</em></li>
+</ul>
+<h1 id="decompilation">Decompilation</h1>
+<p>Decompilation requires some sort of method to reconstruct the CFG precisely, as well as to compute all variables in a stack frame. Any sort of abstract interpretation is able to perform both of these, though VSA is preferred. Data flow analysis is also essential to cleaning up the output of decompilation.</p>
+<p>Most modern papers focus only on two aspects of decompilation:</p>
+<h3 id="accurate-type-recovery">Accurate Type Recovery</h3>
+<p><em>TIE: Principled Reverse Engineering of Types in Binary Programs</em> serves to accurately reconstruct types in binaries. It first makes use of a variant of VSA to determine locations of high-level variables in a subroutine. Then, it formulates and solves for constraints on types of these variables based on how they are used (for example, you can only dereference a <em>pointer</em> type).</p>
+<h3 id="structured-control-flow-reconstruction">Structured Control Flow Reconstruction</h3>
+<p>The paper <em>No More Gotos</em> demonstrates an algorithm that guarantees decompilation free of goto’s, assuming the original source code was also goto-free. It implements this by exploiting the fact that all structured control flow has a single entry point and a single successor. The algorithm breaks a control flow graph up into regions which have a single entry point and a single successor, and also reconstructs control flow by pattern matching on path predicates to each region (i.e. their <em>reaching conditions</em>).</p>
+<p>The follow-up paper <em>Helping Johnny to Analyze Malware</em> defines some other minor corrections to clean up decompilation, like variable congruence (based on liveness analysis) and loop simplification.</p>
+<h2 id="tools-listing-1">Tools Listing</h2>
+<p>The phoenix decompiler, as well as the DREAM decompiler both implement the TIE paper. Meanwhile the DREAM decompiler implements the next two papers. The fcd decompiler also takes inspiration from <em>Helping Johnny to Analyze Malware</em>.</p>
+<h2 id="accompanying-text-2">Accompanying Text</h2>
+<ul>
+<li><em>No More Gotos: Decompilation Using Pattern-Independent Control-Flow Structuring and Semantics-Preserving Transformations</em></li>
+<li><em>Helping Johnny to Analyze Malware: A Usability-Optimized Decompiler and Malware Analysis User Study</em></li>
+<li><em>TIE: Principled Reverse Engineering of Types in Binary Programs</em></li>
+<li><em>Native x86 Decompilation using Semantics-Preserving Structural Analysis and Iterative Control-Flow Structuring</em></li>
+</ul>
+
+        </div>
+        <div id="footer">
+            <ul class="footer-list">
+                <li><a href="https://github.com/toshipiazza"><i class="fa fa-github-alt"></i> Github</a></li>
+                <li><a href="https://www.linkedin.com/pub/toshi-piazza/aa/98b/62b/"><i class="fa fa-linkedin"></i> LinkedIn</a></li>
+            </ul>
+        </div>
+    </body>
+</html>

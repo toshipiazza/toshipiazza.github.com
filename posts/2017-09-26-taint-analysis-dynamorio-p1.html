@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+        <title>setjmp - Taint Analysis with DynamoRIO, Part 1</title>
+        <link rel="stylesheet" type="text/css" href="../css/default.css" />
+        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/font-awesome/4.5.0/css/font-awesome.min.css" />
+        <script type="text/javascript" src="https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+    </head>
+    <body>
+        <div id="header">
+            <div id="logo">
+                <a href="../">setjmp</a>
+            </div>
+            <div id="navigation">
+                <a href="../">Home</a>
+                <a href="../archive.html">Archive</a>
+            </div>
+        </div>
+
+        <div id="content">
+            <h1>Taint Analysis with DynamoRIO, Part 1</h1>
+
+            <div class="info">
+    Posted on September 26, 2017
+    
+    
+    with tags <a href="../tags/dynamorio.html">dynamorio</a>, <a href="../tags/taint%20analysis.html">taint analysis</a>
+    
+</div>
+
+<p>For my master’s thesis at Rensselaer Polytechnic Institute under <a href="http://www.cs.rpi.edu/~milanova/">Ana Milanova</a>, I plan on applying taint analysis to harden ASLR by preventing address leaks during the execution of a program. Because of my familiarity with DynamoRIO, I plan on constructing a taint analysis system specifically for this platform.</p>
+<p>This series of posts will document my progress towards that goal.</p>
+<p>This particular article documents some notes on Dynamic Taint Analysis (DTA) which I’ve found useful, as well as a roadmap for my progress.</p>
+<h1 id="introduction">Introduction</h1>
+<p>Dynamic taint analysis serves to accurately model information flow in a single execution of a program; thus it requires an execution context on which it performs analysis. The technique itself has been explained very thoroughly by Brumley, et al <a href="#fn1" class="footnoteRef" id="fnref1"><sup>1</sup></a> (required reading). In short, It allows us at any point in the execution of a program to determine if a runtime value is <em>tainted</em>, i.e. its value is indirectly or directly affected by a taint source. In most applications of taint analysis, the taint source is user input.</p>
+<p>DynamoRIO, as well as Intel Pin and Valgrind, function almost analogously to a hypervisor for userspace programs; in other words, DynamoRIO executes code directly (with small modifications to the code stream) using an umbrella technique known as binary rewriting or dynamic binary instrumentation, and exposes an API for clients to directly modify the code stream at runtime.</p>
+<h1 id="existing-projects">Existing Projects</h1>
+<p>Below are some projects which use taint analysis, or some simplified form of it for some purpose, though do not necessarily expose some composable API:</p>
+<p>TaintCheck <a href="#fn2" class="footnoteRef" id="fnref2"><sup>2</sup></a> and TaintTrace <a href="#fn3" class="footnoteRef" id="fnref3"><sup>3</sup></a>, two sides of the same coin, implement taint analysis for the purposes of detecting possible exploits. Valgrind and DynamoRIO power these projects, respectively, though the DynamoRIO implementation was never open sourced.</p>
+<p>Bochspwn Reloaded, <a href="#fn4" class="footnoteRef" id="fnref4"><sup>4</sup></a> a talk by j00ru, documents the implementation of a simplified taint analysis engine on top of the bochs emulator (which only targets <code>rep movsb</code> instructions), in order to detect kernel memory disclosures. It applies taint analysis in a similar manner to Dr. Memory, by tainting uninitialized stack and heap allocations.</p>
+<h1 id="existing-apis">Existing APIs</h1>
+<p>There exist many public implementations of taint analysis, some of which expose a dedicated API for use by plugins. These are documented here:</p>
+<p><a href="https://triton.quarkslab.com">Triton</a> implements not only taint analysis, but also a symbolic execution engine via a unified client-facing API. Triton also multiplexes these two features onto multiple implementations; one such implementation makes use of Intel Pin to execute the instructions on a real processor.</p>
+<p>Panda <a href="#fn5" class="footnoteRef" id="fnref5"><sup>5</sup></a> exposes a plugin API for taint analysis and replayable execution traces via the qemu engine; panda implements taint analysis on top of TCG, the internal qemu IR, to be truly platform independent. The <a href="https://github.com/panda-re/panda">project page</a> references many other papers which showcase panda.</p>
+<h1 id="roadmap">Roadmap</h1>
+<p>Due to time constraints I am restricting my research to the ARM architecture; the variety and complexity of x86’s ISA renders it infeasible to implement taint analysis in a stable and complete way in the time span of two semesters.</p>
+<p>However, this project should also result in something composable; because of DynamoRIO’s rich plugin system, it would be prudent to contribute back a library, <code>drtaint</code> which would expose a taint analysis API to clients, similar to the <code>drreg</code> or <code>drx</code> extensions.</p>
+<p>In lieu of these requirements, I propose the following roadmap towards this composable library:</p>
+<ol style="list-style-type: decimal">
+<li>Construct shadow memory scheme for ARM</li>
+<li>Implement taint propagation fastpath for most common opcodes</li>
+<li>Implement taint propagation slowpath for all other opcodes</li>
+<li>Expose a taint source and sink API, as well as a knob to control taint propagation policies</li>
+</ol>
+<p>Once complete, tools such as TaintTrace and Triton may more easily be implemented without having to resort to reimplementing the taint propagation step; this composable library will also drive my forthcoming ASLR hardening tool.</p>
+<div class="footnotes">
+<hr />
+<ol>
+<li id="fn1"><p><em>All You Ever Wanted To Know About Taint Analysis and Forward Symbolic Execution (but might have been too afraid to ask)</em><a href="#fnref1">↩</a></p></li>
+<li id="fn2"><p><em>Dynamic Taint Analysis for Automatic Detection, Analysis and Signature Generation of Exploits on Commodity Software</em><a href="#fnref2">↩</a></p></li>
+<li id="fn3"><p><em>TaintTrace: Efficient Flow Tracing with Dynamic Binary Rewriting</em><a href="#fnref3">↩</a></p></li>
+<li id="fn4"><p><em>Bochspwn Reloaded: Detecting Kernel Memory Disclosure with x86 Emulation and Taint Tracking</em><a href="#fnref4">↩</a></p></li>
+<li id="fn5"><p><em>Tappan Zee (North) Bridge: Mining Memory Accesses for Introspection</em><a href="#fnref5">↩</a></p></li>
+</ol>
+</div>
+
+        </div>
+        <div id="footer">
+            <ul class="footer-list">
+                <li><a href="https://github.com/toshipiazza"><i class="fa fa-github-alt"></i> Github</a></li>
+                <li><a href="https://www.linkedin.com/pub/toshi-piazza/aa/98b/62b/"><i class="fa fa-linkedin"></i> LinkedIn</a></li>
+            </ul>
+        </div>
+    </body>
+</html>

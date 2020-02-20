@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+        <title>setjmp - Taint Analysis with DynamoRIO, Part 2</title>
+        <link rel="stylesheet" type="text/css" href="../css/default.css" />
+        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/font-awesome/4.5.0/css/font-awesome.min.css" />
+        <script type="text/javascript" src="https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+    </head>
+    <body>
+        <div id="header">
+            <div id="logo">
+                <a href="../">setjmp</a>
+            </div>
+            <div id="navigation">
+                <a href="../">Home</a>
+                <a href="../archive.html">Archive</a>
+            </div>
+        </div>
+
+        <div id="content">
+            <h1>Taint Analysis with DynamoRIO, Part 2</h1>
+
+            <div class="info">
+    Posted on October 13, 2017
+    
+    
+    with tags <a href="../tags/dynamorio.html">dynamorio</a>, <a href="../tags/taint%20analysis.html">taint analysis</a>
+    
+</div>
+
+<p>In the previous post, we introduced taint analysis and various frameworks which incorporate taint analysis into their computation. This post is the first in the series to discuss implementation details of taint analysis, on top of a binary instrumentation framework.</p>
+<p>In particular, we will be discussing possible implementations for shadow memory, as well as Dr. Memory’s performant solution to this problem. The existing solution is wrapped up in a library called Umbra, which I port to ARM in this post. My progress is currently detailed <a href="https://github.com/DynamoRIO/drmemory/pull/2044">here</a>. All code examples will be taken from here as well.</p>
+<h1 id="shadow-memory">Shadow Memory</h1>
+<p>Implementing taint analysis in DynamoRIO obviates the necessity of a shadow memory system. For example, we may look to the <code>umbra_app</code> test in the repository where we see the following assembly:</p>
+<pre class="asm"><code>ldr    r4, [r7]
+b      #0x000106e8</code></pre>
+<p>Here, we’re loading a single byte from <code>[r7]</code> and saving it into <code>r4</code>. When using DynamoRIO, we can only perform stateful computation by inserting instrumentation (i.e. assembly) directly into the code stream. So, in order to compute the taint propagation step, we must first pull the taint value of the memory stored at <code>[r7]</code> in order to propagate the taint to the register <code>r4</code>.</p>
+<p>Now, in order to compute the taint value of the memory stored in <code>[r7]</code>, we must first define some mapping from an application address to an associated <em>shadow</em> address; this <em>shadow</em> address serves as a mirrored space for all of the memory used by the application. For umbra on ARM, we now emit the following code in order to determine the shadow address given the application address:</p>
+<pre class="asm"><code> m4  e58a4084   str    r4, [r10, #132]
+ m4  e10f4000   mrs    r4, cpsr
+ m4  e58a4080   str    r4, [r10, #128]
+ m4  e58a0088   str    r0, [r10, #136]
+ m4  e1a04007   mov    r4, r7
+ m4  e58a4008   str    r4, [r10, #8]
+ m4  e30b016c   movw   r0, #45420
+ m4  e3470801   movt   r0, #30721
+ m4  e0800724   add    r0, r0, r4, lsr #14
+ m4  e3c00003   bic    r0, r0, #3
+ m4  e5900000   ldr    r0, [r0]
+ m4  e1a04124   lsr    r4, r4, #2
+ m4  e0844000   add    r4, r4, r0,  #0
+ m4  e5c40000   strb   r0, [r4]
+ L3  e5974000   ldr    r4, [r7]
+ L3  eaffffff   b      #0x000106e8</code></pre>
+<p>For those unfamiliar with DynamoRIO, the <code>m4</code> instructions are <em>meta</em> instructions inserted by our DynamoRIO client, while <code>L3</code> instructions represent the instructions as seen in the original program. These <code>L3</code> instructions should be untouched, effectively. We’ll pull this emitted assembly apart in the next section, to understand the underlying data structures as well as their function.</p>
+<h2 id="page-table-implementation">Page Table Implementation</h2>
+<p>The implementation detailed here is in fact the same one used by Dr. Memory on x86. This logic is currently wrapped up in the Umbra project in the Dr. Memory repository, which I have modified to also support ARM.</p>
+<p>At the heart of the shadow memory mapping scheme lies a page table stored in static memory:</p>
+<div class="sourceCode"><pre class="sourceCode c"><code class="sourceCode c"><span class="co">/* drmemory/umbra/umbra_32.c */</span>
+<span class="co">/* We divide the address space into (64KB) chunk units */</span>
+<span class="ot">#define APP_BLOCK_BITS 16</span>
+<span class="ot">#define SHADOW_TABLE_ENTRIES (1 &lt;&lt; (32 - APP_BLOCK_BITS))</span>
+<span class="dt">static</span> ptr_int_t static_shadow_table[SHADOW_TABLE_ENTRIES];</code></pre></div>
+<p>This table in fact stores a displacement from the application address for performance reasons, at least on x86. In order to use this data structure, we recall that it functions much like a page table; we can compute the index into the page table by simply interpreting the top 16 bits of the address as the index. We then dereference that index into the static shadow table, to compute the displacement. This was implemented previously in x86 with very naive assembly, shown below:</p>
+<pre class="asm"><code>mov ecx, eax
+shr ecx, 0x10
+add eax, [shadow_table + ecx*4]</code></pre>
+<p>Here, <code>%eax</code> initially holds some application address, which is being translated to a shadow address. Furthermore, <code>%ecx</code> here functions as an index into the static shadow table (where each element is 4 bytes). Unfortunately, this code sequence is not so nice on ARM, because we cannot simply express the operand <code>(table,%ecx,4)</code> which performs the operation <code>table + %ecx*4</code>. We instead do the following on ARM:</p>
+<pre class="asm"><code>mov r1, shadow_table
+add r1, r1, r0 lsr #14
+bic r1, r1, #3
+ldr r1, [r1]
+add r0, r0, r1</code></pre>
+<p>Here, <code>r0</code> holds the application address. Note a few key difference in this code sequence. In order to keep from spilling a register, we modify the original expression like so:</p>
+<p>\begin{align*} table + 4 * (addr \gg 16) &amp;\equiv table + ((addr \gg 16) \ll 2) \\ &amp;\equiv table + ((addr \gg 14) \mathrel{\&amp;} \text{0xfffffffc}) \\ &amp;\equiv (table + (addr \gg 14)) \mathrel{\&amp;} \text{0xfffffffc} \end{align*}</p>
+<p>The final step assumes that <code>table</code> is 4-byte aligned, or already has the least significant 2 bits cleared, so that we can move the bitwise <code>and</code> out of the inner expression. In practice, this is true because of the C ABI and alignment rules for the ARM platform. Although not immediately apparent, the expression</p>
+<p>\[ table + (addr \gg 14) \]</p>
+<p>has a direct equivalent in ARM, namely <code>add r1, r1, r0 lsr #14</code>, allowing us to elide a register spill or restore and simplify the emitted code itself.</p>
+<p>Another interesting caveat here is that ARM cannot load the immediate <code>0xfffffffc</code> in order to perform the <code>and</code> operation; we instead opt to use <code>bic</code>, documented <a href="http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.dui0068b/BABGIEBE.html">here</a> which performs something like: <code>op1 &amp; ~op2</code>. In other words, the previous expression becomes:</p>
+<p>\[ (table + (addr \gg 14)) \mathrel{\&amp;} \text{~} 3 \]</p>
+<p>We can now load all required constants (<code>0x3</code>, etc) as immediates in both ARM and in THUMB mode, and this expression mimics exactly the shadow address translation routine shown above.</p>
+<h2 id="memory-usage-optimization">Memory Usage Optimization</h2>
+<p>In a typical application, we do not saturate the entire address space. So, it does not make sense, nor is it feasible to initialize all the shadow memory up front. To alleviate this problem, we actually allocate only a single read-only block at initialization time, with a default value set. This is the block that is referenced by all entries in the page table initially, so our memory usage initially is only the cost of the page table, plus that single shared block.</p>
+<p>Now here’s the kicker: if someone attempts to <em>write</em> to this default shared block, we handle the page fault gracefully in a signal handler. If we notice that the faulted access is within this special read-only shared block, we can replace out the relevant page table entry with a new RW page, and re-execute the faulting instruction.</p>
+<div class="figure">
+<img src="../assets/drtaint/page_table.svg" alt="Relevant diagram for an 8-bit architecture but which functions equivalently. Here, an 8-bit application address 11010110 has top 4 bits 1101, which maps to the last entry in the page table. When dereferenced, we catch the fault and replace it with a new RW page, then re-execute the instruction." />
+<p class="caption">Relevant diagram for an 8-bit architecture but which functions equivalently. Here, an 8-bit application address <code>11010110</code> has top 4 bits <code>1101</code>, which maps to the last entry in the page table. When dereferenced, we catch the fault and replace it with a new RW page, then re-execute the instruction.</p>
+</div>
+<p>Note that this algorthm coincides generally with the concept of copy-on-write (COW), used in a variety of applications as the Linux kernel and the C++ <code>std::string</code> implementation for performance reasons.</p>
+<p>In this manner, we end up only allocating shadow blocks for the blocks which are <em>written</em> to at runtime, which will likely include the stack and the heap, but <em>probably</em> not .text or libc, thus reducing shadow memory usage for an application in general. This is implemented in Dr. Memory proper <a href="https://github.com/DynamoRIO/drmemory/blob/master/drmemory/fastpath.c#L190">here</a>. A far shorter example implemented in a test in the pull request can be found <a href="https://github.com/DynamoRIO/drmemory/pull/2044/files#diff-362cc70f6880e33dbe1dfd2418bbd038R212">here</a>.</p>
+
+        </div>
+        <div id="footer">
+            <ul class="footer-list">
+                <li><a href="https://github.com/toshipiazza"><i class="fa fa-github-alt"></i> Github</a></li>
+                <li><a href="https://www.linkedin.com/pub/toshi-piazza/aa/98b/62b/"><i class="fa fa-linkedin"></i> LinkedIn</a></li>
+            </ul>
+        </div>
+    </body>
+</html>

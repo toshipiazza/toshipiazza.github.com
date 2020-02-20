@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+        <title>setjmp - Dynamic Control-Flow Graph with DynamoRIO</title>
+        <link rel="stylesheet" type="text/css" href="../css/default.css" />
+        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/font-awesome/4.5.0/css/font-awesome.min.css" />
+        <script type="text/javascript" src="https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+    </head>
+    <body>
+        <div id="header">
+            <div id="logo">
+                <a href="../">setjmp</a>
+            </div>
+            <div id="navigation">
+                <a href="../">Home</a>
+                <a href="../archive.html">Archive</a>
+            </div>
+        </div>
+
+        <div id="content">
+            <h1>Dynamic Control-Flow Graph with DynamoRIO</h1>
+
+            <div class="info">
+    Posted on November  4, 2016
+    
+    
+    with tags <a href="../tags/dynamorio.html">dynamorio</a>
+    
+</div>
+
+<h1 id="overview">Overview</h1>
+<p><a href="http://doar-e.github.io/blog/2013/08/31/some-thoughts-about-code-coverage-measurement-with-pin/">This post</a> notes the usefulness of the Intel-based PIN tool for code coverage.</p>
+<p>To recap from this post, we would like to construct a “control flow graph” of a particular program. However, this control flow graph is not statically computed via LLVM given source code, but rather is computed as we’re running this binary. As a result, we can only construct a control flow graph that represents the branches or edges taken at runtime, which is a subset of all possible branches or edges.</p>
+<p>Instead of using PIN, we would like to use DynamoRIO, as it trades PIN’s relatively simplistic API for raw speed.</p>
+<h1 id="first-steps">First Steps</h1>
+<p>It turns out the DynamoRIO contains multiple samples, a few of which construct control flow traces (<code>cbr.c</code>, <code>cbrtrace.c</code>) that can be dumped to a file in a format very similar to that of the original source post’s PIN tool (if you squint).</p>
+<pre><code>$ ./bin64/drrun -c ./api/bin/libcbrtrace.so -- ls
+[ls output]
+$ head api/bin/cbrtrace.ls.01264.0000.log -n1
+0x00007fde53311c00       # basic block
+  [ 0x00007fde53311c4f   # inst addr
+  , 0x00007fde53311c55   # fall-through
+  , 0x00007fde53311ce2 ] # target addr
+ =&gt; 0x00007fde53311c55   # taken branch</code></pre>
+<p>However, these ready-made clients do come with restrictions. First, these samples only instrument conditional branches, and not indirect calls (i.e. <code>call [rax]</code>), nor do they instrument indirect jumps (i.e. <code>jmp [rax]</code>).</p>
+<p>These three classes of instructions together can construct a much more complete CFG at runtime, which directly complement static analysis as it is computationally hard to determine statically the set of all targets an indirect call or jump might take.</p>
+<h2 id="conditional-branches">Conditional Branches</h2>
+<p>We start by working with a modified version of <code>cbr.c</code>, with a few notable differences:</p>
+<ol style="list-style-type: decimal">
+<li><code>cbr.c</code> implements its own hash table, we use the C++11 <code>std::unordered_map</code> container to save space and implementation time.</li>
+<li>This sample is interested in whether a branch is taken or not. We care about the edges of our CFG. The problems are sufficiently similar, but our hashtable instead stores addresses, rather than whether taken.</li>
+<li>When a branch has been taken, we no longer need this complicated instrumentation. And, once both the taken and fallthrough branches have been taken, no instrumentation is needed at all! However, this forces DynamoRIO to fall back on its corner-case design, see <code>DR_EMIT_STORE_TRANSLATIONS</code> in the docs. We keep the instrumentation there for simplicity and stability.</li>
+</ol>
+<p>The instrumentation necessarily will modify conditional branches; we will victimize the original cbr and replace it with our own, which jumps into our <code>at_taken</code> clean call. Otherwise, we will jump into the <code>at_not_taken</code> clean call, as such:</p>
+<div class="sourceCode"><pre class="sourceCode nasm"><code class="sourceCode nasm">  <span class="co">; (1) Original conditional branch, clobbered to jump</span>
+  <span class="co">; to our label.</span>
+  cbr label
+
+  <span class="co">; (2) We fell through the original cbr, so we note that</span>
+  <span class="co">; the path was not taken by calling the `at_not_taken`</span>
+  <span class="co">; clean call.</span>
+  <span class="co">; Afterwards we jump to the original fallthrough address.</span>
+  <span class="kw">push</span> fall
+  <span class="kw">push</span> src
+  <span class="kw">call</span> at_not_taken
+  <span class="kw">jmp</span> fallthrough
+
+<span class="fu">label:</span>
+  <span class="co">; (3) We note that this was the taken branch and jump to</span>
+  <span class="co">; the original target.</span>
+  <span class="kw">push</span> targ
+  <span class="kw">push</span> src
+  <span class="kw">call</span> at_token
+  <span class="kw">jmp</span> target
+
+<span class="fu">fallthrough:</span>
+  <span class="co">; original fallthrough instrumentation</span>
+  ...</code></pre></div>
+<p>To modify the original condition branch, we construct a label and set the instructions target to this label:</p>
+<div class="sourceCode"><pre class="sourceCode c"><code class="sourceCode c"><span class="co">// (1)</span>
+instr_t *label = INSTR_CREATE_label(drcontext);
+instr_set_meta_no_translation(instr);
+<span class="kw">if</span> (instr_is_cti_short(instr))
+    instr = instr_convert_short_meta_jmp_to_long(
+        drcontext, bb, instr);
+instr_set_target(instr, opnd_create_instr(label));</code></pre></div>
+<p>Note that we must perform the above conversion from a short jump to a long jump as necessary, since inserting the fallthrough clean call later might take up a lot of space, even if the clean call has been inlined. As a result the short jump might not be able to reach over to the rest of the instrumentation, resulting in a crash at best.</p>
+<p>The rest is more intuitive, as it is standard DynamoRIO instrumentation manipulation:</p>
+<div class="sourceCode"><pre class="sourceCode c"><code class="sourceCode c"><span class="co">// (2)</span>
+dr_insert_clean_call(drcontext, bb, NULL,
+                     (<span class="dt">void</span> *)at_not_taken,
+                     false,
+                     <span class="dv">2</span>,
+                     OPND_CREATE_INTPTR(src),
+                     OPND_CREATE_INTPTR(fall));
+instr_t *jmp = INSTR_CREATE_jmp(drcontext,
+                                opnd_create_pc(fall));
+instrlist_preinsert(bb, NULL, INSTR_XL8(jmp), fall);
+
+<span class="co">// (3)</span>
+instrlist_meta_preinsert(bb, NULL, label);
+dr_insert_clean_call(drcontext, bb, NULL,
+                     (<span class="dt">void</span> *)at_taken,
+                     false,
+                     <span class="dv">2</span>,
+                     OPND_CREATE_INTPTR(src),
+                     OPND_CREATE_INTPTR(targ));
+jmp = INSTR_CREATE_jmp(drcontext,
+                       opnd_create_pc(targ));
+instrlist_preinsert(bb, NULL, INSTR_XL8(jmp), targ));</code></pre></div>
+<p>At <strong>(2)</strong> we construct the clean call to <code>at_not_taken()</code>, and then jump to the original fallthrough address (computed via <code>decode_next_pc()</code>). At <strong>(3)</strong>, we place the label we created before, and then call the <code>at_taken()</code> clean call and jump to the target, which can be computed via <code>instr_get_branch_target_pc()</code>.</p>
+<p>The two clean calls, <code>at_taken()</code> and <code>at_not_taken()</code> intuitively add the appropriate target address to their respective entries in the hash table:</p>
+<div class="sourceCode"><pre class="sourceCode c"><code class="sourceCode c"><span class="dt">static</span> std::unordered_map&lt;app_pc, std::unordered_set&lt;app_pc&gt;&gt; cbr;
+
+<span class="dt">static</span> <span class="dt">void</span> at_taken(app_pc src, app_pc targ)
+{ cbr[src].insert(targ); }
+
+<span class="dt">static</span> <span class="dt">void</span> at_not_taken(app_pc src, app_pc fall)
+{ cbr[src].insert(fall); }</code></pre></div>
+<p>If we want to be really thorough, we should lock on both of these functions.</p>
+<h2 id="indirect-calls">Indirect Calls</h2>
+<p>It turns out intercepting indirect calls is very simple, as all we need to do is insert a clean call in front of a Indirect call, for example a <code>call $rax</code> instruction, and note the value of <code>rax</code> at that point.</p>
+<p>First, DynamoRIO gives us an <code>instr_is_call_indirect()</code>, which allows us to identify calls of all types, i.e. near and far, as well as the following call variants:</p>
+<ol style="list-style-type: decimal">
+<li><code>call rax</code></li>
+<li><code>call [rax]</code></li>
+<li><code>call [mem]</code></li>
+</ol>
+<p>We can ensure we have exhausted all possible cases by consulting a good reference<a href="#fn1" class="footnoteRef" id="fnref1"><sup>1</sup></a>. It turns out that all three are likely to be seen in the wild, i.e. due to vtable implementations in C++. However, it turns out we can simply reuse the target operand given to us at the DynamoRIO IR API level, allowing us to reuse the code for either case.</p>
+<p>So, we can simply construct this instrumentation as follows:</p>
+<div class="sourceCode"><pre class="sourceCode c"><code class="sourceCode c">DR_ASSERT(instr_is_call_indirect(instr)); <span class="co">// we ensure this</span>
+opnd_t target_opnd = instr_get_target(instr);
+DR_ASSERT(opnd_is_reg(target_opnd) ||
+          opnd_is_memory_reference(target_opnd)));
+reg_id_t target = opnd_get_reg(instr_get_target(instr));
+dr_insert_clean_call(drcontext, bb, NULL,
+                     (<span class="dt">void</span> *)at_ind_call,
+                     false,
+                     <span class="dv">2</span>,
+                     OPND_CREATE_INTPTR(src),
+                     target_opnd);</code></pre></div>
+<p>And now for the clean call, <code>at_ind_call()</code>:</p>
+<div class="sourceCode"><pre class="sourceCode c"><code class="sourceCode c"><span class="dt">static</span> <span class="dt">void</span> at_ind_call(app_pc src, app_pc targ)
+{ cbr[src].insert(targ); }</code></pre></div>
+<h2 id="indirect-jumps">Indirect Jumps</h2>
+<p>Indirect jumps and Indirect calls are functionally very similar; both jumps and calls are forms of control transfer instructions, and given an <code>instr_t *</code> which we’ve determined has some indirect target, we can recycle the code from above.</p>
+<div class="sourceCode"><pre class="sourceCode c"><code class="sourceCode c">reg_id_t target = opnd_get_reg(instr_get_target(instr));</code></pre></div>
+<p>In fact, we can even share the same clean call as there is very little functional difference; The final code comes out to look something like</p>
+<div class="sourceCode"><pre class="sourceCode c"><code class="sourceCode c">DR_ASSERT(instr_is_cti(instr)); <span class="co">// we ensure this</span>
+opnd_t target_opnd = instr_get_target(instr);
+DR_ASSERT(opnd_is_reg(target_opnd) ||
+          opnd_is_memory_reference(target_opnd)));
+dr_insert_clean_call(drcontext, bb, instr,
+                     (<span class="dt">void</span> *)at_ind_cti,
+                     false,
+                     <span class="dv">2</span>,
+                     OPND_CREATE_INTPTR(src),
+                     target_opnd);</code></pre></div>
+<p>Note that we have simply relaxed our preconditions for this code–previously we required a call instruction, but we have generalized to any control transfer instruction. This allows us to reuse the same code for both indirect jumps and for indirect calls. <a href="#fn2" class="footnoteRef" id="fnref2"><sup>2</sup></a></p>
+<h3 id="json">JSON</h3>
+<p>Finally, the most straightforward part is to output our data structure in json. We can use any json library at our disposal, say <a href="https://github.com/nlohmann/json">json</a>, a cool C++11 variant which supports STL-like semantics.</p>
+<div class="sourceCode"><pre class="sourceCode cpp"><code class="sourceCode cpp">json j = { { <span class="st">&quot;branches&quot;</span>, json::array() } };
+std::transform(std::begin(cbr), std::end(cbr),
+               std::back_inserter(j[<span class="st">&quot;branches&quot;</span>]),
+    [] (<span class="kw">auto</span> i) -&gt; json {
+        <span class="kw">return</span> {
+            { <span class="st">&quot;address&quot;</span>, i.first  },
+            { <span class="st">&quot;targets&quot;</span>, i.second }
+        };
+    });
+std::cout &lt;&lt; std::setw(<span class="dv">2</span>) &lt;&lt; j &lt;&lt; std::endl;</code></pre></div>
+<h1 id="test-run">Test Run</h1>
+<script type="text/javascript" src="https://asciinema.org/a/7ciqzh7rkmprinrv9q7vd0m6s.js" id="asciicast-7ciqzh7rkmprinrv9q7vd0m6s" async></script>
+<p>The fully functional code can be found <a href="https://github.com/toshipiazza/drcfg">here</a></p>
+<div class="footnotes">
+<hr />
+<ol>
+<li id="fn1"><p>Reference for the x86 near and far call semantics <a href="http://x86.renejeschke.de/html/file_module_x86_id_26.html">here</a><a href="#fnref1">↩</a></p></li>
+<li id="fn2"><p>One final note: a return instruction is certainly a “cti” instruction with an indirect target, as it pops <code>rsp</code> off of the stack and jumps to it, so it will trigger our codepath and we will record that branch. It doesn’t hurt to have this information, though it might slow down an application to have this instrumentation at every return instruction of every function. We can test for this specific case with a call to <code>instr_is_return()</code>.<a href="#fnref2">↩</a></p></li>
+</ol>
+</div>
+
+        </div>
+        <div id="footer">
+            <ul class="footer-list">
+                <li><a href="https://github.com/toshipiazza"><i class="fa fa-github-alt"></i> Github</a></li>
+                <li><a href="https://www.linkedin.com/pub/toshi-piazza/aa/98b/62b/"><i class="fa fa-linkedin"></i> LinkedIn</a></li>
+            </ul>
+        </div>
+    </body>
+</html>
